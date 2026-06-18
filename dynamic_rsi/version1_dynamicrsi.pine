@@ -1,0 +1,144 @@
+//@version=5
+strategy("BTC Master Dynamic RSI Strategy (All-in-One)", overlay=false, initial_capital=100000000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// --- Preset Selector ---
+preset = input.string("4h (RSI-BB)", "Select Timeframe Preset", 
+     options=["1m (Dynamic RSI)", "15m (RSI-BB)", "1h (Dynamic RSI)", "4h (RSI-BB)", "Custom Parameters"])
+
+// --- Custom Inputs (Active only if 'Custom Parameters' is selected) ---
+custom_mode     = input.string("dynamic", "Custom Mode", options=["dynamic", "rsi-bb"], group="Custom Settings")
+custom_rsi_p    = input.int(14, "Custom RSI Period", group="Custom Settings")
+custom_vol_w    = input.int(20, "Custom Vol/BB Window", group="Custom Settings")
+custom_offset   = input.float(10.0, "Custom Base Offset (Dynamic mode)", group="Custom Settings")
+custom_range    = input.float(15.0, "Custom Vol Range (Dynamic mode)", group="Custom Settings")
+custom_bb_mult  = input.float(2.0, "Custom BB Multiplier (RSI-BB mode)", group="Custom Settings")
+custom_tp       = input.float(0.0, "Custom Take Profit % (0 to disable)", group="Custom Settings")
+custom_sl       = input.float(0.0, "Custom Stop Loss % (0 to disable)", group="Custom Settings")
+
+// --- Initialize Variables ---
+var int rsi_period = 14
+var string mode = "dynamic"
+var int vol_window = 20
+var float base_offset = 10.0
+var float vol_range = 15.0
+var float bb_mult = 2.0
+var float tp_pct = 0.0
+var float sl_pct = 0.0
+
+// --- Assign Preset Parameters ---
+if preset == "1m (Dynamic RSI)"
+    rsi_period := 21
+    mode := "dynamic"
+    vol_window := 30
+    base_offset := 20.0
+    vol_range := 20.0
+    tp_pct := 0.0
+    sl_pct := 0.0
+else if preset == "15m (RSI-BB)"
+    rsi_period := 9
+    mode := "rsi-bb"
+    vol_window := 20
+    bb_mult := 2.5
+    tp_pct := 2.0
+    sl_pct := 0.0
+else if preset == "1h (Dynamic RSI)"
+    rsi_period := 21
+    mode := "dynamic"
+    vol_window := 30
+    base_offset := 20.0
+    vol_range := 20.0
+    tp_pct := 15.0
+    sl_pct := 0.0
+else if preset == "4h (RSI-BB)"
+    rsi_period := 21
+    mode := "rsi-bb"
+    vol_window := 30
+    bb_mult := 2.5
+    tp_pct := 15.0
+    sl_pct := 2.0
+else // Custom Parameters
+    rsi_period := custom_rsi_p
+    mode := custom_mode
+    vol_window := custom_vol_w
+    base_offset := custom_offset
+    vol_range := custom_range
+    bb_mult := custom_bb_mult
+    tp_pct := custom_tp
+    sl_pct := custom_sl
+
+// --- Calculations ---
+// 1. Standard RSI
+rsi = ta.rsi(close, rsi_period)
+
+// 2. Dynamic Thresholds (Price Volatility Method)
+returns = (close - close[1]) / close[1]
+volatility = ta.stdev(returns, vol_window)
+roll_min = ta.lowest(volatility, 100)
+roll_max = ta.highest(volatility, 100)
+denom = roll_max - roll_min
+vol_norm = denom == 0 ? 0.0 : (volatility - roll_min) / denom
+
+dynamic_ob = 50.0 + base_offset + (vol_range * vol_norm)
+dynamic_os = 50.0 - base_offset - (vol_range * vol_norm)
+
+// 3. RSI Bollinger Bands (RSI-BB Method)
+rsi_sma = ta.sma(rsi, vol_window)
+rsi_std = ta.stdev(rsi, vol_window)
+bb_ob = rsi_sma + (bb_mult * rsi_std)
+bb_os = rsi_sma - (bb_mult * rsi_std)
+
+// Select Active Thresholds based on mode
+ob = mode == "rsi-bb" ? bb_ob : dynamic_ob
+os = mode == "rsi-bb" ? bb_os : dynamic_os
+
+// Clip boundaries for sanity
+ob_clipped = math.max(50.0, math.min(99.0, ob))
+os_clipped = math.max(1.0, math.min(50.0, os))
+
+// --- Plotting ---
+plot(rsi, title="RSI", color=color.purple, linewidth=2)
+plot(ob_clipped, title="Upper Band (OB)", color=color.red, linewidth=1)
+plot(os_clipped, title="Lower Band (OS)", color=color.green, linewidth=1)
+hline(50, "Center Line", color=color.gray, linestyle=hline.style_dashed)
+
+// Fill area between bands
+band1 = plot(ob_clipped, color=color.new(color.red, 90), display=display.none)
+band2 = plot(os_clipped, color=color.new(color.green, 90), display=display.none)
+fill(band1, band2, color=color.new(color.purple, 95))
+
+// --- Trading Strategy Logic ---
+longCondition = rsi < os_clipped
+shortCondition = rsi > ob_clipped
+
+if (strategy.position_size == 0)
+    if (longCondition)
+        strategy.entry("Long", strategy.long)
+    else if (shortCondition)
+        strategy.entry("Short", strategy.short)
+else if (strategy.position_size > 0)
+    if (shortCondition)
+        strategy.entry("Short", strategy.short)
+else if (strategy.position_size < 0)
+    if (longCondition)
+        strategy.entry("Long", strategy.long)
+
+// Exit via Take Profit and Stop Loss
+if (strategy.position_size > 0)
+    limitPrice = tp_pct > 0 ? strategy.position_avg_price * (1 + tp_pct / 100.0) : na
+    stopPrice = sl_pct > 0 ? strategy.position_avg_price * (1 - sl_pct / 100.0) : na
+    strategy.exit("Exit Long", from_entry="Long", limit=limitPrice, stop=stopPrice)
+else if (strategy.position_size < 0)
+    limitPrice = tp_pct > 0 ? strategy.position_avg_price * (1 - tp_pct / 100.0) : na
+    stopPrice = sl_pct > 0 ? strategy.position_avg_price * (1 + sl_pct / 100.0) : na
+    strategy.exit("Exit Short", from_entry="Short", limit=limitPrice, stop=stopPrice)
+
+// Plot entry shapes on the oscillator panel
+buy_signal = (strategy.position_size > 0 and strategy.position_size[1] <= 0) or (longCondition and strategy.position_size == 0)
+sell_signal = (strategy.position_size < 0 and strategy.position_size[1] >= 0) or (shortCondition and strategy.position_size == 0)
+
+plotshape(buy_signal, title="Buy Arrow", style=shape.triangleup, location=location.bottom, color=color.green, size=size.small)
+plotshape(sell_signal, title="Sell Arrow", style=shape.triangledown, location=location.top, color=color.red, size=size.small)
+
+// --- Alerts ---
+alertcondition(buy_signal, title="Buy Alert", message="Master Strategy: Long Entry Signal Triggered!")
+alertcondition(sell_signal, title="Sell Alert", message="Master Strategy: Short Entry Signal Triggered!")

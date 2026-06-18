@@ -1,0 +1,141 @@
+// ══════════════════════════════════════════════════════════════
+// RSI Divergence Universal Strategy - PRO VERSION
+// Works on ANY ticker and ANY timeframe.
+// Added: EMA Trend Filter, HTF Risk Management, & ADX Sideways Filter
+// ══════════════════════════════════════════════════════════════
+//@version=5
+strategy("RSI Divergence Universal PRO", overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1,
+         slippage=2,
+         calc_on_every_tick=false)
+
+// ── Inputs ──────────────────────────────────────────────────
+// 1. Divergence Settings (Optimized Universal Params)
+rsiPeriod   = input.int(28,   "RSI Period",          minval=2, group="RSI Divergence Settings")
+obLevel     = input.int(65,   "Overbought Level",    minval=50, maxval=95, group="RSI Divergence Settings")
+osLevel     = input.int(25,   "Oversold Level",      minval=5,  maxval=50, group="RSI Divergence Settings")
+divLookback = input.int(20,   "Divergence Lookback", minval=2, group="RSI Divergence Settings")
+pivLeft     = input.int(5,    "Pivot Left Bars",     minval=1, group="RSI Divergence Settings")
+pivRight    = input.int(2,    "Pivot Right Bars",    minval=1, group="RSI Divergence Settings")
+
+// 2. Trend Filter (Boosts Profitability)
+useEma      = input.bool(true, "Gunakan EMA 200 Trend Filter", group="Trend Filter", tooltip="Hanya ambil sinyal yang searah dengan trend besar (EMA 200) untuk winrate & PnL lebih tinggi.")
+emaPeriod   = input.int(200,   "EMA Period", minval=10, group="Trend Filter")
+
+// 3. Sideways Filter (ADX)
+useAdx      = input.bool(true, "Gunakan ADX Sideways Filter", group="Sideways Filter", tooltip="Hindari trading saat market sedang sideways/choppy (ADX di bawah threshold).")
+adxLen      = input.int(14,    "ADX Length", minval=1, group="Sideways Filter")
+adxThresh   = input.float(20.0,"ADX Threshold", minval=1, group="Sideways Filter", tooltip="Jika nilai ADX di bawah angka ini, market dianggap sideways.")
+
+// 4. Risk Management (Normal Timeframes < 4H)
+atrPeriod   = input.int(14,    "ATR Period",          minval=1, group="Risk Management (LTF < 4H)")
+tpMult      = input.float(1.5, "TP ATR Multiplier",   minval=0.1, step=0.1, group="Risk Management (LTF < 4H)")
+slMult      = input.float(1.0, "SL ATR Multiplier",   minval=0.1, step=0.1, group="Risk Management (LTF < 4H)")
+
+// 5. HTF Risk Management (High Timeframes >= 4H)
+useHtfRisk  = input.bool(true,  "Auto scale TP/SL untuk TF Besar (>= 4H)", group="Risk Management (HTF >= 4H)", tooltip="Otomatis menggunakan rasio TP/SL yang lebih besar saat di Timeframe 4H, Daily, atau Weekly.")
+htfTpMult   = input.float(3.0,  "HTF TP ATR Multiplier", minval=0.1, step=0.5, group="Risk Management (HTF >= 4H)")
+htfSlMult   = input.float(1.5,  "HTF SL ATR Multiplier", minval=0.1, step=0.1, group="Risk Management (HTF >= 4H)")
+
+// ── Timeframe Detection ─────────────────────────────────────
+isHTF = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly or (timeframe.isminutes and timeframe.multiplier >= 240)
+
+activeTpMult = useHtfRisk and isHTF ? htfTpMult : tpMult
+activeSlMult = useHtfRisk and isHTF ? htfSlMult : slMult
+
+// ── Indicators ──────────────────────────────────────────────
+rsiVal = ta.rsi(close, rsiPeriod)
+atrVal = ta.atr(atrPeriod)
+emaVal = ta.ema(close, emaPeriod)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+isSideways = useAdx and (adxVal < adxThresh)
+
+// ── Pivot detection ─────────────────────────────────────────
+pivotLow  = ta.pivotlow(low,  pivLeft, pivRight)
+pivotHigh = ta.pivothigh(high, pivLeft, pivRight)
+
+rsiPivotLow  = ta.pivotlow(rsiVal, pivLeft, pivRight)
+rsiPivotHigh = ta.pivothigh(rsiVal, pivLeft, pivRight)
+
+// ── Track previous pivots ───────────────────────────────────
+var float prevPriceLow   = na
+var float prevRsiLow     = na
+var int   prevPriceLowBar = na
+
+var float prevPriceHigh  = na
+var float prevRsiHigh    = na
+var int   prevPriceHighBar = na
+
+// ── Bullish Divergence Detection ────────────────────────────
+bullDiv = false
+if not na(pivotLow)
+    currPriceLow = low[pivRight]
+    currRsiLow   = rsiVal[pivRight]
+    if not na(prevPriceLow) and (bar_index - prevPriceLowBar) <= divLookback
+        // Price: lower low  |  RSI: higher low
+        if currPriceLow < prevPriceLow and currRsiLow > prevRsiLow
+            if currRsiLow < osLevel + 20
+                bullDiv := true
+    prevPriceLow    := currPriceLow
+    prevRsiLow      := currRsiLow
+    prevPriceLowBar := bar_index
+
+// ── Bearish Divergence Detection ────────────────────────────
+bearDiv = false
+if not na(pivotHigh)
+    currPriceHigh = high[pivRight]
+    currRsiHigh   = rsiVal[pivRight]
+    if not na(prevPriceHigh) and (bar_index - prevPriceHighBar) <= divLookback
+        // Price: higher high  |  RSI: lower high
+        if currPriceHigh > prevPriceHigh and currRsiHigh < prevRsiHigh
+            if currRsiHigh > obLevel - 20
+                bearDiv := true
+    prevPriceHigh    := currPriceHigh
+    prevRsiHigh      := currRsiHigh
+    prevPriceHighBar := bar_index
+
+// ── Trend & Sideways Filter Logic ───────────────────────────
+validBull = bullDiv and (not useEma or close > emaVal) and not isSideways
+validBear = bearDiv and (not useEma or close < emaVal) and not isSideways
+
+// ── Strategy entries ────────────────────────────────────────
+if validBull and strategy.position_size == 0
+    stopLoss   = close - atrVal * activeSlMult
+    takeProfit = close + atrVal * activeTpMult
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", "Long", stop=stopLoss, limit=takeProfit)
+
+if validBear and strategy.position_size == 0
+    stopLoss   = close + atrVal * activeSlMult
+    takeProfit = close - atrVal * activeTpMult
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", "Short", stop=stopLoss, limit=takeProfit)
+
+// ── Visual indicators ───────────────────────────────────────
+plot(useEma ? emaVal : na, "EMA Filter", color=color.new(color.orange, 0), linewidth=2)
+
+// Highlight sideways zone background
+bgcolor(isSideways ? color.new(color.gray, 90) : na, title="Sideways Market Background")
+
+plotshape(bullDiv, title="Bullish Div", location=location.belowbar,
+          style=shape.triangleup, size=size.small,
+          color=color.new(color.green, 70), text="Div")
+
+plotshape(bearDiv, title="Bearish Div", location=location.abovebar,
+          style=shape.triangledown, size=size.small,
+          color=color.new(color.red, 70), text="Div")
+          
+plotshape(validBull, title="Valid Bullish Entry", location=location.belowbar,
+          style=shape.labelup, size=size.normal,
+          color=color.new(color.green, 0), text="BULL", textcolor=color.white)
+
+plotshape(validBear, title="Valid Bearish Entry", location=location.abovebar,
+          style=shape.labeldown, size=size.normal,
+          color=color.new(color.red, 0), text="BEAR", textcolor=color.white)
+
+// ── Alerts ──────────────────────────────────────────────────
+alertcondition(validBull, title="Valid Bullish Divergence", message="RSI Bullish Divergence detected (with trend, high momentum)!")
+alertcondition(validBear, title="Valid Bearish Divergence", message="RSI Bearish Divergence detected (with trend, high momentum)!")

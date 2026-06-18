@@ -1,0 +1,450 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+//  ║   BTC Dynamic RSI v7 (Gap Feature)                                       ║
+//  ║   (version7_dynamicrsi.pine)                                             ║
+//  ║                                                                          ║
+//  ║   UPGRADE & FIX DARI VERSION 4/5:                                        ║
+//  ║                                                                          ║
+//  ║   🟢 [DOKUMENTASI TAG & LABEL ORDER TANPA SINGKATAN]                     ║
+//  ║      - Tag buy/sell dan exit diubah menjadi teks lengkap:                ║
+//  ║        "Long Entry", "Short Entry", "Take Profit Long", "Cut Loss Long", ║
+//  ║        "Take Profit Short", "Cut Loss Short", "Mean-Reversion Exit Long",║
+//  ║        "Mean-Reversion Exit Short".                                      ║
+//  ║                                                                          ║
+//  ║   🟢 [HARGA ENTRY & EXIT DI PLOT SECARA HISTORIS & LIVE]                  ║
+//  ║      - Menambahkan label dinamis di sub-pane RSI untuk setiap entry/exit. ║
+//  ║      - Label Entry menampilkan harga masuk persis.                       ║
+//  ║      - Label Exit menampilkan harga keluar dan persentase PnL bersih.    ║
+//  ║                                                                          ║
+//  ║   🟢 [OPTIMASI PENUH TIMEFRAME 1M, 1H, 4H FUTURES]                       ║
+//  ║      - 1m: RSI=14, BB=15, Mult=2.7, TP=1.5%, SL=1.0%, Direct Entry,      ║
+//  ║            Anomaly Filter aktif. (Profitabel meskipun ada fee drag).     ║
+//  ║      - 1h: RSI=9, BB=50, Mult=2.5, TP=10.0%, SL=10.0%, Confirmation.     ║
+//  ║            (Stop Loss lebar mencegah premature stop outs).               ║
+//  ║      - 4h: RSI=21, BB=30, Mult=2.7, TP=10.0%, SL=6.0%, Confirmation.     ║
+//  ║                                                                          ║
+//  ║   🟢 [PERBAIKAN CUSTOM PARAMETERS (Kompilasi Dinamis)]                   ║
+//  ║      - Menghapus inisialisasi 'var' pada variabel parameter utama agar   ║
+//  ║        re-evaluasi custom input berjalan real-time saat settings diubah. ║
+//  ║      - Menambahkan penanda grup Custom agar user tahu preset harus       ║
+//  ║        diatur ke "Custom Parameters" terlebih dahulu.                    ║
+//  ╚══════════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+strategy("BTC Dynamic RSI v7 (Gap Feature)", overlay=false,
+         initial_capital=100000000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET SELECTOR
+// ══════════════════════════════════════════════════════════════════════
+preset = input.string("15m (RSI-BB)", "Select Timeframe Preset",
+     options=["1m (Dynamic RSI)", "15m (RSI-BB)", "1h (Dynamic RSI)", "4h (RSI-BB)", "Custom Parameters"],
+     tooltip="Pilih preset sesuai timeframe chart yang sedang dibuka")
+
+// ══════════════════════════════════════════════════════════════════════
+//  CUSTOM INPUTS  (Aktif hanya saat preset = Custom Parameters)
+// ══════════════════════════════════════════════════════════════════════
+custom_mode     = input.string("rsi-bb", "Mode", options=["dynamic", "rsi-bb"],
+                  group="Custom Settings (Select 'Custom Parameters' Preset first)")
+custom_rsi_p    = input.int(14,    "RSI Period",                      group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=2)
+custom_vol_w    = input.int(20,    "Vol/BB Window",                   group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=5)
+custom_offset   = input.float(10.0,"Base Offset (Dynamic)",           group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0)
+custom_range    = input.float(15.0,"Vol Range (Dynamic)",             group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0)
+custom_bb_mult  = input.float(2.8, "BB Multiplier (RSI-BB)",          group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0.5, step=0.1)
+custom_entry_t  = input.string("Confirmation", "Entry Type", options=["Direct", "Confirmation"], group="Custom Settings (Select 'Custom Parameters' Preset first)",
+                  tooltip="Direct: enter immediately on band touch | Confirmation: wait for cross back")
+custom_use_adx  = input.bool(false, "Use ADX Filter",                 group="Custom Settings (Select 'Custom Parameters' Preset first)", tooltip="Filter entri saat tren terlalu kuat")
+custom_adx_t    = input.float(30.0,"ADX Threshold",                   group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=1.0, maxval=100.0)
+custom_use_anom = input.bool(true, "Use Anomaly Filter",             group="Custom Settings (Select 'Custom Parameters' Preset first)", tooltip="Filter entri saat ada lonjakan harga ekstrem (candle body > 3 * ATR)")
+custom_tp       = input.float(2.0, "Take Profit % (0=off)",           group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0)
+custom_sl       = input.float(2.0, "Stop Loss % (0=off)",             group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0)
+custom_mrv      = input.bool(false,"Use Mean-Rev Exit",               group="Custom Settings (Select 'Custom Parameters' Preset first)",
+                  tooltip="Keluar otomatis ketika RSI kembali ke midline (RSI_SMA atau level 50)")
+custom_use_sideways     = input.bool(false, "Use Sideways Entry Filter", group="Custom Settings (Select 'Custom Parameters' Preset first)", tooltip="Filter entri saat market sedang sideways")
+custom_sideways_src     = input.string("Choppiness Index", "Sideways Source", options=["ADX", "Choppiness Index"], group="Custom Settings (Select 'Custom Parameters' Preset first)")
+custom_sideways_adx_t   = input.float(20.0, "Sideways ADX Threshold", group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=1.0, maxval=100.0)
+custom_sideways_chop_t  = input.float(61.8, "Sideways Chop Threshold", group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=0.0, maxval=100.0)
+custom_use_time_ex      = input.bool(true, "Use Sideways Time Exit", group="Custom Settings (Select 'Custom Parameters' Preset first)", tooltip="Keluar otomatis jika posisi tertahan lama di market sideways")
+custom_max_bars         = input.int(30, "Max Bars in Trade", group="Custom Settings (Select 'Custom Parameters' Preset first)", minval=1)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PARAMETER INITIALIZATION (Tanpa 'var' agar dinamis)
+// ══════════════════════════════════════════════════════════════════════
+int    rsi_period              = 14
+string mode                    = "rsi-bb"
+int    vol_window              = 20
+float  base_offset             = 10.0
+float  vol_range               = 15.0
+float  bb_mult                 = 2.8
+string entry_type              = "Confirmation"
+bool   use_anomaly_filter      = true
+float  tp_pct                  = 2.0
+float  sl_pct                  = 2.0
+bool   use_mrv_exit            = false
+bool   use_adx_filter          = false
+float  adx_threshold           = 30.0
+bool   use_sideways_filter     = false
+string sideways_source         = "Choppiness Index"
+float  sideways_adx_threshold  = 20.0
+float  sideways_chop_threshold = 61.8
+bool   use_time_exit           = true
+int    max_bars_exit           = 30
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET ASSIGNMENT
+// ══════════════════════════════════════════════════════════════════════
+if preset == "1m (Dynamic RSI)"
+    rsi_period         := 14
+    mode               := "rsi-bb"
+    vol_window         := 15
+    bb_mult            := 2.7
+    entry_type         := "Direct"
+    use_anomaly_filter := true
+    tp_pct             := 1.5
+    sl_pct             := 1.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    adx_threshold      := 30.0
+    use_sideways_filter := false
+    use_time_exit      := true
+    max_bars_exit      := 20
+
+else if preset == "15m (RSI-BB)"
+    rsi_period         := 14
+    mode               := "rsi-bb"
+    vol_window         := 20
+    bb_mult            := 2.8
+    entry_type         := "Confirmation"
+    use_anomaly_filter := true
+    tp_pct             := 2.0
+    sl_pct             := 2.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    adx_threshold      := 30.0
+    use_sideways_filter := false
+    use_time_exit      := true
+    max_bars_exit      := 30
+
+else if preset == "1h (Dynamic RSI)"
+    rsi_period         := 9
+    mode               := "rsi-bb"
+    vol_window         := 50
+    bb_mult            := 2.5
+    entry_type         := "Confirmation"
+    use_anomaly_filter := true
+    tp_pct             := 10.0
+    sl_pct             := 10.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    adx_threshold      := 30.0
+    use_sideways_filter := false
+    use_time_exit      := true
+    max_bars_exit      := 40
+
+else if preset == "4h (RSI-BB)"
+    rsi_period         := 21
+    mode               := "rsi-bb"
+    vol_window         := 30
+    bb_mult            := 2.7
+    entry_type         := "Confirmation"
+    use_anomaly_filter := true
+    tp_pct             := 10.0
+    sl_pct             := 6.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    adx_threshold      := 30.0
+    use_sideways_filter := false
+    use_time_exit      := true
+    max_bars_exit      := 30
+
+else  // Custom Parameters
+    rsi_period         := custom_rsi_p
+    mode               := custom_mode
+    vol_window         := custom_vol_w
+    base_offset        := custom_offset
+    vol_range          := custom_range
+    bb_mult            := custom_bb_mult
+    entry_type         := custom_entry_t
+    use_anomaly_filter := custom_use_anom
+    tp_pct             := custom_tp
+    sl_pct             := custom_sl
+    use_mrv_exit       := custom_mrv
+    use_adx_filter     := custom_use_adx
+    adx_threshold      := custom_adx_t
+    use_sideways_filter := custom_use_sideways
+    sideways_source    := custom_sideways_src
+    sideways_adx_threshold := custom_sideways_adx_t
+    sideways_chop_threshold := custom_sideways_chop_t
+    use_time_exit      := custom_use_time_ex
+    max_bars_exit      := custom_max_bars
+
+// ══════════════════════════════════════════════════════════════════════
+//  KALKULASI INDIKATOR
+// ══════════════════════════════════════════════════════════════════════
+
+// 1. RSI
+rsi = ta.rsi(close, rsi_period)
+
+// 2. Dynamic Thresholds — Volatility-Normalized Method
+returns    = (close - close[1]) / close[1]
+volatility = ta.stdev(returns, vol_window)
+roll_min   = ta.lowest(volatility, 100)
+roll_max   = ta.highest(volatility, 100)
+denom      = roll_max - roll_min
+vol_norm   = denom == 0 ? 0.0 : (volatility - roll_min) / denom
+
+dynamic_ob = 50.0 + base_offset + (vol_range * vol_norm)
+dynamic_os = 50.0 - base_offset - (vol_range * vol_norm)
+
+// 3. RSI Bollinger Bands Method
+rsi_sma = ta.sma(rsi, vol_window)
+rsi_std = ta.stdev(rsi, vol_window)
+bb_ob   = rsi_sma + (bb_mult * rsi_std)
+bb_os   = rsi_sma - (bb_mult * rsi_std)
+
+// 4. Select Active Thresholds berdasarkan mode
+ob = mode == "rsi-bb" ? bb_ob : dynamic_ob
+os = mode == "rsi-bb" ? bb_os : dynamic_os
+
+// 5. Clip boundary untuk keamanan (jangan sampai OB < 50 atau OS > 50)
+ob_clipped = math.max(50.0, math.min(99.0, ob))
+os_clipped = math.max(1.0,  math.min(50.0, os))
+
+// 6. Midpoint untuk Mean-Reversion Exit
+rsi_mid = mode == "rsi-bb" ? rsi_sma : 50.0
+
+// 7. ADX (Average Directional Index) Calculation
+adx_len = 14
+tr_val  = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+plus_dm  = high - high[1] > low[1] - low ? math.max(high - high[1], 0) : 0
+minus_dm = low[1] - low > high - high[1] ? math.max(low[1] - low, 0) : 0
+
+tr_smooth       = ta.rma(tr_val, adx_len)
+plus_dm_smooth  = ta.rma(plus_dm, adx_len)
+minus_dm_smooth = ta.rma(minus_dm, adx_len)
+
+di_plus  = tr_smooth == 0 ? 0.0 : 100.0 * plus_dm_smooth / tr_smooth
+di_minus = tr_smooth == 0 ? 0.0 : 100.0 * minus_dm_smooth / tr_smooth
+dx       = (di_plus + di_minus) == 0 ? 0.0 : 100.0 * math.abs(di_plus - di_minus) / (di_plus + di_minus)
+adx      = ta.rma(dx, adx_len)
+
+// ══════════════════════════════════════════════════════════════════════
+//  SIGNAL GENERATION & ANOMALY FILTER
+// ══════════════════════════════════════════════════════════════════════
+
+// 8. Choppiness Index (CHOP) Calculation (Manual v5 Implementation)
+chop_len = 14
+sumTr = math.sum(ta.tr(true), chop_len)
+highestHigh = ta.highest(high, chop_len)
+lowestLow = ta.lowest(low, chop_len)
+rangePrice = highestHigh - lowestLow
+chop = rangePrice == 0.0 ? 0.0 : 100.0 * math.log10(sumTr / rangePrice) / math.log10(chop_len)
+
+// Menentukan kondisi sideways (Dideklarasikan langsung sebagai bool)
+is_sideways = use_sideways_filter ? (sideways_source == "ADX" ? (adx < sideways_adx_threshold) : (chop > sideways_chop_threshold)) : false
+
+// ─── GAP FEATURE (Dari v7) ──────────────────────────────────────────
+
+// State variables untuk penanganan sideways
+var bool sideways_wait = false
+var string exit_reason = ""
+
+// Entry Signals (Menunggu gap minimal 9.1 - 17.1 sebelum eksekusi)
+var bool pending_long = false
+var bool pending_short = false
+
+// Sinyal Crossing untuk trigger
+raw_long_trigger  = ta.crossunder(rsi, os_clipped)
+raw_short_trigger = ta.crossover(rsi, ob_clipped)
+
+if strategy.position_size == 0
+    if raw_long_trigger or raw_short_trigger
+        sideways_wait := false
+
+// Update state pending
+if raw_long_trigger
+    pending_long := true
+    pending_short := false // batalkan short jika ada long baru
+
+if raw_short_trigger
+    pending_short := true
+    pending_long := false // batalkan long jika ada short baru
+
+// Hitung gap jarak
+gap_long = rsi - os_clipped
+gap_short = ob_clipped - rsi
+
+// Hitung durasi pending
+var int pending_long_bars = 0
+var int pending_short_bars = 0
+
+pending_long_bars  := pending_long  ? pending_long_bars + 1  : 0
+pending_short_bars := pending_short ? pending_short_bars + 1 : 0
+
+// Logic Pembatalan (Cancel)
+if pending_long
+    if gap_long > 17.1 or pending_long_bars > 15 or rsi >= rsi_mid
+        pending_long := false
+
+if pending_short
+    if gap_short > 17.1 or pending_short_bars > 15 or rsi <= rsi_mid
+        pending_short := false
+
+long_entry_sig = false
+short_entry_sig = false
+
+if pending_long
+    if gap_long >= 9.1 and gap_long <= 17.1
+        long_entry_sig := true
+        pending_long := false
+
+if pending_short
+    if gap_short >= 9.1 and gap_short <= 17.1
+        short_entry_sig := true
+        pending_short := false
+
+// ─── END GAP FEATURE ────────────────────────────────────────────────
+
+// Filter Anomali Harga Ekstrem (Menggunakan ATR)
+atr_len = 14
+atr = ta.atr(atr_len)
+candle_body = math.abs(close - close[1])
+is_anomaly = candle_body > 3.0 * atr          // Deteksi lonjakan ekstrem tubuh candle > 3x ATR
+
+// Sinyal Entri Terfilter (Menggunakan Sideways Filter & Wait State)
+adx_allow = not use_adx_filter or (adx < adx_threshold)
+long_sig  = long_entry_sig and adx_allow and (not use_anomaly_filter or not is_anomaly) and (not use_sideways_filter or not is_sideways) and not sideways_wait
+short_sig = short_entry_sig and adx_allow and (not use_anomaly_filter or not is_anomaly) and (not use_sideways_filter or not is_sideways) and not sideways_wait
+
+// Mean-Reversion Exit Signals
+mrv_long_exit  = use_mrv_exit and ta.crossover(rsi, rsi_mid)
+mrv_short_exit = use_mrv_exit and ta.crossunder(rsi, rsi_mid)
+
+// ══════════════════════════════════════════════════════════════════════
+//  STRATEGI TRADING & ORDER TAGGING (Tanpa Singkatan)
+// ══════════════════════════════════════════════════════════════════════
+
+// LANGKAH 1: TP/SL Exit Orders
+if tp_pct > 0 or sl_pct > 0
+    if strategy.position_size > 0
+        lim_l = tp_pct > 0 ? strategy.position_avg_price * (1.0 + tp_pct / 100.0) : na
+        stp_l = sl_pct > 0 ? strategy.position_avg_price * (1.0 - sl_pct / 100.0) : na
+        strategy.exit("Exit Long", from_entry="Long Entry", limit=lim_l, stop=stp_l,
+                      comment_profit="Take Profit Long", comment_loss="Cut Loss Long",
+                      alert_profit="Take Profit Long", alert_loss="Cut Loss Long")
+    else if strategy.position_size < 0
+        lim_s = tp_pct > 0 ? strategy.position_avg_price * (1.0 - tp_pct / 100.0) : na
+        stp_s = sl_pct > 0 ? strategy.position_avg_price * (1.0 + sl_pct / 100.0) : na
+        strategy.exit("Exit Short", from_entry="Short Entry", limit=lim_s, stop=stp_s,
+                      comment_profit="Take Profit Short", comment_loss="Cut Loss Short",
+                      alert_profit="Take Profit Short", alert_loss="Cut Loss Short")
+
+// LANGKAH 1.5: Sideways Time-Based Exit
+bars_since_entry = strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1) : 0
+time_exit_triggered = use_time_exit and strategy.position_size != 0 and bars_since_entry >= max_bars_exit
+
+if time_exit_triggered
+    if strategy.position_size > 0
+        strategy.close("Long Entry", comment="Sideways Exit Long")
+    else if strategy.position_size < 0
+        strategy.close("Short Entry", comment="Sideways Exit Short")
+    sideways_wait := true
+    exit_reason := "Sideways Exit"
+
+// LANGKAH 2: Mean-Reversion Exit
+if mrv_long_exit and strategy.position_size > 0 and not time_exit_triggered
+    strategy.close("Long Entry", comment="Mean-Reversion Exit Long")
+    exit_reason := "Mean-Reversion Exit"
+if mrv_short_exit and strategy.position_size < 0 and not time_exit_triggered
+    strategy.close("Short Entry", comment="Mean-Reversion Exit Short")
+    exit_reason := "Mean-Reversion Exit"
+
+// LANGKAH 3: Entry Signals
+if long_sig
+    strategy.entry("Long Entry", strategy.long, comment="Long Entry")
+if short_sig
+    strategy.entry("Short Entry", strategy.short, comment="Short Entry")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTTING LABELS - HARGA ENTRY & EXIT HISTORIS & SEKARANG
+// ══════════════════════════════════════════════════════════════════════
+
+if ta.change(strategy.position_size) != 0
+    // 1. Deteksi Exit (Flipped / Closed)
+    if (strategy.position_size[1] != 0 and strategy.position_size == 0) or (strategy.position_size[1] != 0 and strategy.position_size != 0 and strategy.position_size[1] * strategy.position_size < 0)
+        if strategy.closedtrades > 0
+            int   last_trade = strategy.closedtrades - 1
+            float ent_p      = strategy.closedtrades.entry_price(last_trade)
+            float ext_p      = strategy.closedtrades.exit_price(last_trade)
+            
+            // Periksa arah posisi dari entry ID
+            bool is_long     = strategy.closedtrades.entry_id(last_trade) == "Long Entry"
+            float pnl_pct    = (ext_p - ent_p) / ent_p * 100.0 * (is_long ? 1.0 : -1.0)
+            
+            string reason    = exit_reason != "" ? exit_reason : (pnl_pct > 0 ? "Take Profit" : "Cut Loss")
+            // Reset exit_reason setelah digunakan
+            exit_reason := ""
+            string dir_str   = is_long ? "Long" : "Short"
+            
+            lbl_text = reason + " " + dir_str + "\nEntry: " + str.tostring(ent_p, "#.##") + "\nExit: " + str.tostring(ext_p, "#.##") + "\nPnL: " + str.tostring(pnl_pct, "+#.##") + "%"
+            
+            // Jika flip terjadi, geser label exit 1 bar ke belakang agar tidak bertumpukan dengan label entry baru
+            bool is_flip = (strategy.position_size[1] != 0 and strategy.position_size != 0 and strategy.position_size[1] * strategy.position_size < 0)
+            int label_x = is_flip ? bar_index - 1 : bar_index
+            float label_y = is_flip ? rsi[1] : rsi
+            
+            label.new(label_x, label_y, text=lbl_text, 
+                      color=pnl_pct > 0 ? color.new(color.blue, 15) : color.new(color.orange, 15), 
+                      textcolor=color.white, 
+                      style=is_long ? label.style_label_down : label.style_label_up, 
+                      size=size.small)
+                      
+    // 2. Deteksi Entry (Opened / Flipped)
+    if (strategy.position_size[1] == 0 and strategy.position_size != 0) or (strategy.position_size[1] != 0 and strategy.position_size != 0 and strategy.position_size[1] * strategy.position_size < 0)
+        float ent_p    = strategy.position_avg_price
+        string dir_str = strategy.position_size > 0 ? "Long" : "Short"
+        lbl_text = dir_str + " Entry\nPrice: " + str.tostring(ent_p, "#.##")
+        label.new(bar_index, rsi, text=lbl_text, 
+                  color=strategy.position_size > 0 ? color.new(color.green, 15) : color.new(color.red, 15), 
+                  textcolor=color.white, 
+                  style=strategy.position_size > 0 ? label.style_label_up : label.style_label_down, 
+                  size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTTING RSI & BANDS
+// ══════════════════════════════════════════════════════════════════════
+rsi_color = strategy.position_size > 0 ? color.new(color.lime, 20) : strategy.position_size < 0 ? color.new(color.red, 20) : color.purple
+plot(rsi, title="RSI", color=rsi_color, linewidth=2)
+
+// Bands OB/OS
+ob_plot = plot(ob_clipped, title="Upper Band (OB)", color=color.new(color.red,   30), linewidth=1)
+os_plot = plot(os_clipped, title="Lower Band (OS)", color=color.new(color.green, 30), linewidth=1)
+
+// Midline untuk Mean-Reversion Exit
+plot(rsi_mid, title="MRV Exit Line", color=color.new(color.orange, 40), linewidth=1, style=plot.style_circles)
+
+// Center line 50
+hline(50, "Center 50", color=color.new(color.gray, 60), linestyle=hline.style_dashed)
+
+// Fill antara OB dan OS
+fill(ob_plot, os_plot, color=color.new(color.purple, 93))
+
+// Background warna posisi aktif
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 96) : strategy.position_size < 0 ? color.new(color.red, 96) : na, title="Position Background")
+
+// PLOT ADX (Hanya jika aktif)
+plot(use_adx_filter ? adx : na, title="ADX Line", color=color.new(color.orange, 40), linewidth=1)
+plot(use_adx_filter ? adx_threshold : na, title="ADX Threshold", color=color.new(color.red, 60), style=plot.style_line, linewidth=1)
+
+// Penanda Entry Arrows standar
+plotshape(long_sig,  title="Long Entry Arrow",  style=shape.triangleup, location=location.bottom, color=color.green, size=size.small)
+plotshape(short_sig, title="Short Entry Arrow", style=shape.triangledown, location=location.top, color=color.red, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════
+alertcondition(long_sig,  title="🟢 Long Entry Alert",  message="BTC v7: LONG Entry! RSI oversold gap.")
+alertcondition(short_sig, title="🔴 Short Entry Alert", message="BTC v7: SHORT Entry! RSI overbought gap.")

@@ -1,0 +1,577 @@
+//@version=6
+strategy("BTC Dynamic RSI v6 (Trailing Stop)", overlay=false,
+         initial_capital=100000000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=450,
+         commission_type=strategy.commission.percent,
+         commission_value=0.02)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET SELECTOR
+// ══════════════════════════════════════════════════════════════════════
+preset = input.string("15m (RSI-BB)", "Select Timeframe Preset",
+     options=["1m (Dynamic RSI)", "15m (RSI-BB)", "1h (Dynamic RSI)", "4h (RSI-BB)", "Custom Parameters"],
+     tooltip="Pilih preset sesuai timeframe chart yang sedang dibuka")
+
+// ══════════════════════════════════════════════════════════════════════
+//  CUSTOM INPUTS  (Aktif hanya saat preset = Custom Parameters)
+// ══════════════════════════════════════════════════════════════════════
+custom_mode     = input.string("rsi-bb", "Custom Mode", options=["dynamic", "rsi-bb"],
+                  group="Custom Settings", tooltip="dynamic=volatility adaptive | rsi-bb=Bollinger Band pada RSI")
+custom_rsi_p    = input.int(14,    "Custom RSI Period",               group="Custom Settings", minval=2)
+custom_vol_w    = input.int(20,    "Custom Vol/BB Window",            group="Custom Settings", minval=5)
+custom_offset   = input.float(10.0,"Custom Base Offset (Dynamic)",    group="Custom Settings", minval=0)
+custom_range    = input.float(15.0,"Custom Vol Range (Dynamic)",      group="Custom Settings", minval=0)
+custom_bb_mult  = input.float(2.8, "Custom BB Multiplier (RSI-BB)",   group="Custom Settings", minval=0.5, step=0.1)
+custom_entry_t  = input.string("Confirmation", "Custom Entry Type", options=["Direct", "Confirmation"], group="Custom Settings",
+                  tooltip="Direct: enter immediately on band touch | Confirmation: wait for cross back")
+custom_use_ema  = input.bool(true, "Custom Use EMA 200 Filter",       group="Custom Settings", tooltip="Hanya Long di atas EMA 200, Short di bawah EMA 200")
+custom_ema_buffer = input.float(0.20, "Custom EMA 200 Buffer %",       group="Custom Settings", minval=0.0, maxval=2.0, step=0.05, tooltip="Buffer % di atas/bawah EMA 200 untuk menghindari whipsaw dekat support/resistance")
+custom_use_adx  = input.bool(false, "Custom Use ADX Filter",          group="Custom Settings", tooltip="Filter entri saat tren terlalu kuat")
+custom_adx_t    = input.float(30.0,"Custom ADX Threshold",            group="Custom Settings", minval=1.0, maxval=100.0)
+custom_use_anom = input.bool(true, "Custom Use Anomaly Filter",      group="Custom Settings", tooltip="Filter entri saat ada lonjakan harga ekstrem (candle body > 3 * ATR)")
+custom_use_vol_anom  = input.bool(true, "Custom Use Volume Anomaly Filter", group="Custom Settings", tooltip="Filter entri jika volume melonjak secara tiba-tiba")
+custom_vol_anom_mult = input.float(3.0, "Custom Vol Anomaly Multiplier",   group="Custom Settings", minval=1.0, step=0.1, tooltip="Volume harus lebih besar dari multiplier ini dikali volume sebelumnya")
+custom_use_candle_conf = input.bool(true, "Custom Use Candle Color Confirmation", group="Custom Settings", tooltip="Konfirmasi entri tipe Confirmation dengan warna candle (Long harus hijau, Short harus merah)")
+custom_max_os_limit = input.float(45.0, "Custom Max OS Limit", group="Custom Settings", minval=30.0, maxval=50.0, tooltip="Batas maksimum untuk level oversold (OS)")
+custom_min_ob_limit = input.float(55.0, "Custom Min OB Limit", group="Custom Settings", minval=50.0, maxval=70.0, tooltip="Batas minimum untuk level overbought (OB)")
+custom_tp       = input.float(2.0, "Custom Take Profit % (0=off)",    group="Custom Settings", minval=0)
+custom_sl       = input.float(2.0, "Custom Stop Loss % (0=off)",      group="Custom Settings", minval=0)
+custom_mrv      = input.bool(false,"Custom Use Mean-Rev Exit",        group="Custom Settings",
+                  tooltip="Keluar otomatis ketika RSI kembali ke midline (RSI_SMA atau level 50)")
+
+// ── Trailing Stop Custom Inputs ──
+custom_use_trail    = input.bool(true,  "Custom Use Trailing Stop",          group="Trailing Stop Settings",
+                      tooltip="Aktifkan trailing stop dinamis berbasis ATR. Menggunakan Pine built-in trail.")
+custom_trail_mult   = input.float(2.5,  "Custom Trail ATR Multiplier",      group="Trailing Stop Settings", minval=0.5, step=0.1,
+                      tooltip="Multiplier ATR untuk gap trailing. Lebih besar = lebih lebar, lebih aman dari whipsaw")
+custom_trail_min    = input.float(0.8,  "Custom Trail Min % (dari harga)",  group="Trailing Stop Settings", minval=0.1, step=0.1,
+                      tooltip="Trailing gap minimum sebagai % dari harga (floor)")
+custom_trail_max    = input.float(5.0,  "Custom Trail Max % (dari harga)",  group="Trailing Stop Settings", minval=0.5, step=0.5,
+                      tooltip="Trailing gap maksimum sebagai % dari harga (ceiling)")
+custom_trail_act    = input.float(1.0,  "Custom Trail Activation Profit %", group="Trailing Stop Settings", minval=0.1, step=0.1,
+                      tooltip="Trailing stop baru aktif setelah profit mencapai % ini dari entry price")
+
+// ── Cooldown Custom Inputs ──
+custom_cooldown     = input.int(24, "Custom Cooldown Bars", group="Cooldown Settings", minval=0,
+                      tooltip="Jumlah bar menunggu sebelum boleh open posisi searah setelah exit (mencegah re-entry whipsaw)")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PARAMETER INITIALIZATION
+// ══════════════════════════════════════════════════════════════════════
+var int    rsi_period         = 14
+var string mode               = "dynamic"
+var int    vol_window         = 20
+var float  base_offset        = 10.0
+var float  vol_range          = 15.0
+var float  bb_mult            = 2.0
+var string entry_type         = "Direct"
+var bool   use_anomaly_filter = false
+var float  tp_pct             = 0.0
+var float  sl_pct             = 0.0
+var bool   use_mrv_exit       = false
+var bool   use_ema_filter     = false
+var float  ema_buffer         = 0.0
+var bool   use_adx_filter     = false
+var float  adx_threshold      = 30.0
+var bool   use_vol_anom       = true
+var float  vol_anom_mult      = 3.0
+var bool   use_candle_conf    = true
+var float  max_os_limit       = 50.0
+var float  min_ob_limit       = 50.0
+
+// ── Trailing Stop Variables ──
+var bool   use_trail              = false
+var float  trail_mult             = 2.5
+var float  trail_min_pct          = 0.8
+var float  trail_max_pct          = 5.0
+var float  trail_activation_pct   = 1.0
+
+// ── Cooldown Variable ──
+var int    cooldown_bars          = 0
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET ASSIGNMENT
+// ══════════════════════════════════════════════════════════════════════
+if preset == "1m (Dynamic RSI)"
+    rsi_period         := 21
+    mode               := "dynamic"
+    vol_window         := 30
+    base_offset        := 20.0
+    vol_range          := 20.0
+    entry_type         := "Direct"
+    use_anomaly_filter := false
+    use_vol_anom       := true
+    vol_anom_mult      := 3.0
+    use_candle_conf    := true
+    max_os_limit       := 50.0
+    min_ob_limit       := 50.0
+    ema_buffer         := 0.0
+    tp_pct             := 1.5
+    sl_pct             := 0.75
+    use_mrv_exit       := true
+    use_adx_filter     := false
+    // ── Trailing Stop: Scalping agresif ──
+    use_trail            := true
+    trail_mult           := 1.5
+    trail_min_pct        := 0.3
+    trail_max_pct        := 1.5
+    trail_activation_pct := 0.4
+    cooldown_bars        := 10
+
+else if preset == "15m (RSI-BB)"
+    // ── BTCUSDT.P Binance Futures — dioptimasi untuk 15m ──
+    rsi_period         := 14
+    mode               := "rsi-bb"
+    vol_window         := 20
+    bb_mult            := 3.0        // Diperbesar dari 2.8 ke 3.0 agar lebih ketat mengambil extreme
+    entry_type         := "Confirmation"
+    use_anomaly_filter := true
+    use_vol_anom       := true
+    vol_anom_mult      := 3.0
+    use_candle_conf    := true
+    max_os_limit       := 48.0
+    min_ob_limit       := 52.0
+    ema_buffer         := 0.20
+    tp_pct             := 2
+    sl_pct             := 2
+    use_mrv_exit       := false
+    use_ema_filter     := true       // Filter Trend diaktifkan untuk mengurangi counter-trend trades
+    use_adx_filter     := true
+    adx_threshold      := 30.0
+    // ── Trailing Stop: Tuned untuk BTC 15m volatilitas ──
+    // Kunci: Activation > Max Gap agar saat aktif, posisi sudah TERKUNCI dalam profit
+    use_trail            := true
+    trail_mult           := 1.5      // 1.5x ATR → gap ~$350-750 pada BTC
+    trail_min_pct        := 0.5      // Min gap 0.5% → ~$350 pada BTC $70k
+    trail_max_pct        := 1.2      // Max gap 1.2% → cap untuk extreme vol
+    trail_activation_pct := 1.5      // Aktivasi setelah +1.5% profit (Stop loss pindah ke min +0.3% profit)
+    cooldown_bars        := 8       // Cooldown 24 bar (6 jam) setelah exit untuk mencegah ping-pong
+
+else if preset == "(RSI-BB) Extreme"
+    rsi_period         := 14
+    mode               := "rsi-bb"
+    vol_window         := 20
+    bb_mult            := 2.2        // Scalping: sinyal cukup frequent
+    entry_type         := "Confirmation"
+    use_anomaly_filter := true
+    use_vol_anom       := true
+    vol_anom_mult      := 3.0
+    use_candle_conf    := true
+    max_os_limit       := 50.0
+    min_ob_limit       := 50.0
+    ema_buffer         := 0.0
+    tp_pct             := 1.5          // Net setelah komisi: +1.46%
+    sl_pct             := 0.8           // Net setelah komisi: -0.84%
+    use_mrv_exit       := false
+    use_ema_filter     := false           // OFF: terlalu banyak filter di ranging market
+    use_adx_filter     := false
+    adx_threshold      := 30.0
+    // Trailing Stop — activation < max_gap (WAJIB)
+    use_trail            := true
+    trail_mult           := 1.8      // ATR multiplier
+    trail_min_pct        := 0.30       // Floor gap
+    trail_max_pct        := 1.5       // Ceiling gap
+    trail_activation_pct := 0.50   // Auto-safe: min(0.50, 1.5*0.6)
+    cooldown_bars        := 3            // 0.8 jam — OK untuk scalping
+
+    // === STATISTIK ===
+    // Breakeven win rate : 36.5%
+    // Reward:Risk (net)  : 1.74:1
+    // EV per trade @55WR : +0.42%
+    // Profit lock saat trail aktif: -1.00% (BERBAHAYA)
+
+else if preset == "1h (Dynamic RSI)"
+    rsi_period         := 21
+    mode               := "dynamic"
+    vol_window         := 30
+    base_offset        := 20.0
+    vol_range          := 20.0
+    entry_type         := "Direct"
+    use_anomaly_filter := false
+    use_vol_anom       := true
+    vol_anom_mult      := 3.0
+    use_candle_conf    := true
+    max_os_limit       := 50.0
+    min_ob_limit       := 50.0
+    ema_buffer         := 0.0
+    tp_pct             := 15.0
+    sl_pct             := 5.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    // ── Trailing Stop: Swing menengah ──
+    use_trail            := true
+    trail_mult           := 3.0
+    trail_min_pct        := 1.5
+    trail_max_pct        := 6.0
+    trail_activation_pct := 2.0
+    cooldown_bars        := 12
+
+else if preset == "4h (RSI-BB)"
+    rsi_period         := 21
+    mode               := "rsi-bb"
+    vol_window         := 30
+    bb_mult            := 2.5
+    entry_type         := "Direct"
+    use_anomaly_filter := false
+    use_vol_anom       := true
+    vol_anom_mult      := 3.0
+    use_candle_conf    := true
+    max_os_limit       := 50.0
+    min_ob_limit       := 50.0
+    ema_buffer         := 0.0
+    tp_pct             := 15.0
+    sl_pct             := 4.0
+    use_mrv_exit       := false
+    use_adx_filter     := false
+    // ── Trailing Stop: Position trading konservatif ──
+    use_trail            := true
+    trail_mult           := 3.5
+    trail_min_pct        := 2.0
+    trail_max_pct        := 10.0
+    trail_activation_pct := 3.0
+    cooldown_bars        := 6
+
+else  // Custom Parameters
+    rsi_period         := custom_rsi_p
+    mode               := custom_mode
+    vol_window         := custom_vol_w
+    base_offset        := custom_offset
+    vol_range          := custom_range
+    bb_mult            := custom_bb_mult
+    entry_type         := custom_entry_t
+    use_anomaly_filter := custom_use_anom
+    use_vol_anom       := custom_use_vol_anom
+    vol_anom_mult      := custom_vol_anom_mult
+    use_candle_conf    := custom_use_candle_conf
+    max_os_limit       := custom_max_os_limit
+    min_ob_limit       := custom_min_ob_limit
+    tp_pct             := custom_tp
+    sl_pct             := custom_sl
+    use_mrv_exit       := custom_mrv
+    use_ema_filter     := custom_use_ema
+    ema_buffer         := custom_ema_buffer
+    use_adx_filter     := custom_use_adx
+    adx_threshold      := custom_adx_t
+    // ── Trailing Stop: Custom ──
+    use_trail            := custom_use_trail
+    trail_mult           := custom_trail_mult
+    trail_min_pct        := custom_trail_min
+    trail_max_pct        := custom_trail_max
+    trail_activation_pct := custom_trail_act
+    cooldown_bars        := custom_cooldown
+
+// ══════════════════════════════════════════════════════════════════════
+//  KALKULASI INDIKATOR
+// ══════════════════════════════════════════════════════════════════════
+
+// 1. RSI
+rsi = ta.rsi(close, rsi_period)
+
+// 2. Dynamic Thresholds — Volatility-Normalized Method
+returns    = (close - close[1]) / close[1]
+volatility = ta.stdev(returns, vol_window)
+roll_min   = ta.lowest(volatility, 100)
+roll_max   = ta.highest(volatility, 100)
+denom      = roll_max - roll_min
+vol_norm   = denom == 0 ? 0.0 : (volatility - roll_min) / denom
+
+dynamic_ob = 50.0 + base_offset + (vol_range * vol_norm)
+dynamic_os = 50.0 - base_offset - (vol_range * vol_norm)
+
+// 3. RSI Bollinger Bands Method
+rsi_sma = ta.sma(rsi, vol_window)
+rsi_std = ta.stdev(rsi, vol_window)
+bb_ob   = rsi_sma + (bb_mult * rsi_std)
+bb_os   = rsi_sma - (bb_mult * rsi_std)
+
+// 4. Select Active Thresholds berdasarkan mode
+ob = mode == "rsi-bb" ? bb_ob : dynamic_ob
+os = mode == "rsi-bb" ? bb_os : dynamic_os
+
+// 5. Clip boundary untuk keamanan (jangan sampai OB < 50 atau OS > 50)
+ob_clipped = math.max(min_ob_limit, math.min(99.0, ob))
+os_clipped = math.max(1.0,  math.min(max_os_limit, os))
+
+// 6. Midpoint untuk Mean-Reversion Exit
+rsi_mid = mode == "rsi-bb" ? rsi_sma : 50.0
+
+// 7. ADX (Average Directional Index) Calculation
+adx_len = 14
+tr_val  = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+plus_dm  = high - high[1] > low[1] - low ? math.max(high - high[1], 0) : 0
+minus_dm = low[1] - low > high - high[1] ? math.max(low[1] - low, 0) : 0
+
+tr_smooth       = ta.rma(tr_val, adx_len)
+plus_dm_smooth  = ta.rma(plus_dm, adx_len)
+minus_dm_smooth = ta.rma(minus_dm, adx_len)
+
+di_plus  = tr_smooth == 0 ? 0.0 : 100.0 * plus_dm_smooth / tr_smooth
+di_minus = tr_smooth == 0 ? 0.0 : 100.0 * minus_dm_smooth / tr_smooth
+dx       = (di_plus + di_minus) == 0 ? 0.0 : 100.0 * math.abs(di_plus - di_minus) / (di_plus + di_minus)
+adx      = ta.rma(dx, adx_len)
+
+// 8. ATR
+atr_len = 14
+atr = ta.atr(atr_len)
+
+// ══════════════════════════════════════════════════════════════════════
+//  SIGNAL GENERATION & ANOMALY FILTER
+// ══════════════════════════════════════════════════════════════════════
+
+// Sinyal Crossing (Direct vs Confirmation)
+rsi_cross_under_os = ta.crossunder(rsi, os_clipped)
+rsi_cross_over_ob  = ta.crossover(rsi, ob_clipped)
+
+rsi_cross_over_os  = ta.crossover(rsi, os_clipped)
+rsi_cross_under_ob = ta.crossunder(rsi, ob_clipped)
+
+long_entry_sig  = entry_type == "Direct" ? rsi_cross_under_os : (rsi_cross_over_os and (not use_candle_conf or close > open))
+short_entry_sig = entry_type == "Direct" ? rsi_cross_over_ob  : (rsi_cross_under_ob and (not use_candle_conf or close < open))
+
+// Filter Anomali Harga Ekstrem (Menggunakan ATR)
+candle_body = math.abs(close - close[1])
+is_anomaly = candle_body > 3.0 * atr
+
+// Filter Anomali Volume
+is_vol_anomaly = not na(volume[1]) and volume[1] > 0 and volume > (volume[1] * vol_anom_mult)
+
+// ── Cooldown Filter (Mencegah re-entry searah terlalu cepat) ──
+// Hanya aktifkan cooldown jika open posisi searah dengan trade yang terakhir ditutup
+var float last_exit_dir = 0.0
+if strategy.closedtrades > 0
+    last_exit_dir := math.sign(strategy.closedtrades.size(strategy.closedtrades - 1))
+
+bars_since_exit = strategy.closedtrades > 0 ? bar_index - strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1) : 1000
+
+cooldown_long_allow  = not (last_exit_dir ==  1.0 and bars_since_exit < cooldown_bars)
+cooldown_short_allow = not (last_exit_dir == -1.0 and bars_since_exit < cooldown_bars)
+
+// ── EMA 200 Filter dengan Buffer Zone ──
+ema200 = ta.ema(close, 200)
+ema_long_allow  = not use_ema_filter or close > ema200 * (1.0 + ema_buffer / 100.0)
+ema_short_allow = not use_ema_filter or close < ema200 * (1.0 - ema_buffer / 100.0)
+
+// Sinyal Entri Terfilter
+adx_long_allow  = not use_adx_filter or not (adx >= adx_threshold and di_minus > di_plus)
+adx_short_allow = not use_adx_filter or not (adx >= adx_threshold and di_plus > di_minus)
+long_sig  = long_entry_sig and adx_long_allow and (not use_vol_anom or not is_vol_anomaly) and (not use_anomaly_filter or not is_anomaly) and cooldown_long_allow and ema_long_allow
+short_sig = short_entry_sig and adx_short_allow and (not use_vol_anom or not is_vol_anomaly) and (not use_anomaly_filter or not is_anomaly) and cooldown_short_allow and ema_short_allow
+
+// Mean-Reversion Exit Signals
+mrv_long_exit  = use_mrv_exit and ta.crossover(rsi, rsi_mid)
+mrv_short_exit = use_mrv_exit and ta.crossunder(rsi, rsi_mid)
+
+// ══════════════════════════════════════════════════════════════════════
+//  STRATEGI TRADING
+// ══════════════════════════════════════════════════════════════════════
+
+// Deteksi posisi baru terbuka
+new_long_pos  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+new_short_pos = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// Simpan trailing parameters yang dihitung saat entry (Custom Trailing Stop)
+var float long_trail_sl = na
+var float short_trail_sl = na
+var float long_highest = na
+var float short_lowest = na
+var float stored_tp_long  = na
+var float stored_sl_long  = na
+var float stored_tp_short = na
+var float stored_sl_short = na
+var float stored_trail_gap_display = na  // Untuk info table
+
+// ── LONG: Exit order initialization (sekali saat posisi baru) ──
+if new_long_pos
+    float gap_price = math.max(trail_min_pct * strategy.position_avg_price / 100.0,
+                     math.min(trail_max_pct * strategy.position_avg_price / 100.0,
+                               atr * trail_mult))
+    stored_trail_gap_display := gap_price
+    stored_tp_long := tp_pct > 0 ? strategy.position_avg_price * (1.0 + tp_pct / 100.0) : na
+    stored_sl_long := sl_pct > 0 ? strategy.position_avg_price * (1.0 - sl_pct / 100.0) : na
+    long_highest := high
+    long_trail_sl := na
+
+// Update Long trailing stop level di setiap bar
+if strategy.position_size > 0
+    if high > long_highest
+        long_highest := high
+    float gap_price = na(stored_trail_gap_display) ? (atr * trail_mult) : stored_trail_gap_display
+    float act_price = trail_activation_pct * strategy.position_avg_price / 100.0
+    if use_trail and (long_highest - strategy.position_avg_price) >= act_price
+        float new_trail_sl = long_highest - gap_price
+        if na(long_trail_sl) or new_trail_sl > long_trail_sl
+            long_trail_sl := new_trail_sl
+else
+    long_trail_sl := na
+    long_highest := na
+
+// ── SHORT: Exit order initialization (sekali saat posisi baru) ──
+if new_short_pos
+    float gap_price_s = math.max(trail_min_pct * strategy.position_avg_price / 100.0,
+                       math.min(trail_max_pct * strategy.position_avg_price / 100.0,
+                                atr * trail_mult))
+    stored_trail_gap_display := gap_price_s
+    stored_tp_short := tp_pct > 0 ? strategy.position_avg_price * (1.0 - tp_pct / 100.0) : na
+    stored_sl_short := sl_pct > 0 ? strategy.position_avg_price * (1.0 + sl_pct / 100.0) : na
+    short_lowest := low
+    short_trail_sl := na
+
+// Update Short trailing stop level di setiap bar
+if strategy.position_size < 0
+    if low < short_lowest
+        short_lowest := low
+    float gap_price_s = na(stored_trail_gap_display) ? (atr * trail_mult) : stored_trail_gap_display
+    float act_price_s = trail_activation_pct * strategy.position_avg_price / 100.0
+    if use_trail and (strategy.position_avg_price - short_lowest) >= act_price_s
+        float new_trail_sl_s = short_lowest + gap_price_s
+        if na(short_trail_sl) or new_trail_sl_s < short_trail_sl
+            short_trail_sl := new_trail_sl_s
+else
+    short_trail_sl := na
+    short_lowest := na
+
+// ── Jalankan Exit Orders (di setiap bar untuk memperbarui Stop Price) ──
+if strategy.position_size > 0
+    float active_sl_long = na(long_trail_sl) ? stored_sl_long : long_trail_sl
+    strategy.exit("XL", from_entry="Long",
+                  limit=stored_tp_long, stop=active_sl_long,
+                  comment_profit="TP ✓", comment_loss=na(long_trail_sl) ? "SL ✗" : "Trail ↑")
+
+if strategy.position_size < 0
+    float active_sl_short = na(short_trail_sl) ? stored_sl_short : short_trail_sl
+    strategy.exit("XS", from_entry="Short",
+                  limit=stored_tp_short, stop=active_sl_short,
+                  comment_profit="TP ✓", comment_loss=na(short_trail_sl) ? "SL ✗" : "Trail ↓")
+// ── Mean-Reversion Exit ──
+if mrv_long_exit and strategy.position_size > 0
+    strategy.close("Long", comment="MRV ↑")
+if mrv_short_exit and strategy.position_size < 0
+    strategy.close("Short", comment="MRV ↓")
+
+// ── Entry Signals ──
+if long_sig
+    strategy.entry("Long",  strategy.long,  comment="OS Entry" + (entry_type == "Direct" ? " (D)" : " (C)"))
+if short_sig
+    strategy.entry("Short", strategy.short, comment="OB Entry" + (entry_type == "Direct" ? " (D)" : " (C)"))
+
+// ══════════════════════════════════════════════════════════════════════
+//  ESTIMATED TRAILING STATUS (untuk visualisasi)
+// ══════════════════════════════════════════════════════════════════════
+
+// Estimasi apakah trailing sudah aktif (untuk display, bukan logic)
+est_trail_active_long = not na(long_trail_sl)
+est_trail_active_short = not na(short_trail_sl)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTTING
+// ══════════════════════════════════════════════════════════════════════
+
+// Warna RSI berubah berdasarkan posisi aktif
+rsi_color = strategy.position_size > 0 ? color.new(color.lime, 20) : strategy.position_size < 0 ? color.new(color.red, 20) : color.purple
+
+plot(rsi, title="RSI", color=rsi_color, linewidth=2)
+
+// Bands OB/OS
+ob_plot = plot(ob_clipped, title="Upper Band (OB)", color=color.new(color.red,   30), linewidth=1)
+os_plot = plot(os_clipped, title="Lower Band (OS)", color=color.new(color.green, 30), linewidth=1)
+
+// Midline untuk Mean-Reversion Exit (ditampilkan sebagai referensi)
+plot(rsi_mid, title="MRV Exit Line", color=color.new(color.orange, 40),
+     linewidth=1, style=plot.style_circles)
+
+// Center line 50
+hline(50, "Center 50", color=color.new(color.gray, 60), linestyle=hline.style_dashed)
+
+// Fill antara OB dan OS
+fill(ob_plot, os_plot, color=color.new(color.purple, 93))
+
+// Background warna menunjukkan kondisi posisi saat ini
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 96) : strategy.position_size < 0 ? color.new(color.red, 96) : na, title="Position Background")
+
+// Plot EMA 200 jika filter aktif
+plot(use_ema_filter ? ema200 : na, title="EMA 200", color=color.new(color.yellow, 0), linewidth=2)
+
+// PLOT ADX (Hanya ditampilkan jika filter ADX diaktifkan)
+plot(use_adx_filter ? adx : na, title="ADX Line", color=color.new(color.orange, 40), linewidth=1)
+plot(use_adx_filter ? adx_threshold : na, title="ADX Threshold", color=color.new(color.red, 60), style=plot.style_line, linewidth=1)
+
+// ── Trailing Stop Status Visualization ──
+trail_status_long  = est_trail_active_long  ? 5.0  : na
+trail_status_short = est_trail_active_short ? 95.0 : na
+
+plot(trail_status_long,  title="Trail Active (Long)",  color=color.new(color.yellow, 20),
+     style=plot.style_circles, linewidth=2)
+plot(trail_status_short, title="Trail Active (Short)", color=color.new(color.yellow, 20),
+     style=plot.style_circles, linewidth=2)
+
+bgcolor(est_trail_active_long ? color.new(color.yellow, 94) : est_trail_active_short ? color.new(color.yellow, 94) : na,
+        title="Trailing Active Background")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTSHAPE — Penanda Entry & Exit
+// ══════════════════════════════════════════════════════════════════════
+
+// Entry arrows
+plotshape(long_sig,  title="Long Entry ▲",  style=shape.triangleup,
+          location=location.bottom, color=color.green, size=size.small)
+plotshape(short_sig, title="Short Entry ▼", style=shape.triangledown,
+          location=location.top,    color=color.red,   size=size.small)
+
+// Mean-Reversion Exit markers
+mrv_long_plot  = mrv_long_exit  and strategy.position_size[1] > 0
+mrv_short_plot = mrv_short_exit and strategy.position_size[1] < 0
+plotshape(mrv_long_plot,  title="MRV Exit Long ×",  style=shape.xcross,
+          location=location.top,    color=color.new(color.blue, 20), size=size.tiny)
+plotshape(mrv_short_plot, title="MRV Exit Short ×", style=shape.xcross,
+          location=location.bottom, color=color.new(color.blue, 20), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════
+//  INFO TABLE — Parameter & Status
+// ══════════════════════════════════════════════════════════════════════
+var table info_tbl = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 70),
+                               border_color=color.new(color.gray, 60), border_width=1)
+
+if barstate.islast
+    table.cell(info_tbl, 0, 0, "Trailing Stop", text_color=color.yellow, text_size=size.small)
+    table.cell(info_tbl, 1, 0, use_trail ? "ON (built-in)" : "OFF",
+               text_color=use_trail ? color.lime : color.red, text_size=size.small)
+
+    table.cell(info_tbl, 0, 1, "ATR Mult",      text_color=color.white, text_size=size.tiny)
+    table.cell(info_tbl, 1, 1, str.tostring(trail_mult, "#.#") + "x",
+               text_color=color.silver, text_size=size.tiny)
+
+    table.cell(info_tbl, 0, 2, "Min/Max %",     text_color=color.white, text_size=size.tiny)
+    table.cell(info_tbl, 1, 2, str.tostring(trail_min_pct, "#.#") + " / " + str.tostring(trail_max_pct, "#.#"),
+               text_color=color.silver, text_size=size.tiny)
+
+    table.cell(info_tbl, 0, 3, "Activation",    text_color=color.white, text_size=size.tiny)
+    table.cell(info_tbl, 1, 3, str.tostring(trail_activation_pct, "#.#") + "%",
+               text_color=color.silver, text_size=size.tiny)
+
+    table.cell(info_tbl, 0, 4, "Entry Gap",     text_color=color.white, text_size=size.tiny)
+    table.cell(info_tbl, 1, 4, na(stored_trail_gap_display) ? "—" : "$" + str.tostring(stored_trail_gap_display, "#.##"),
+               text_color=color.aqua, text_size=size.tiny)
+
+    string trail_status = "—"
+    color trail_col = color.gray
+    if est_trail_active_long
+        trail_status := "ACTIVE ($" + str.tostring(long_trail_sl, "#.#") + ")"
+        trail_col := color.lime
+    else if est_trail_active_short
+        trail_status := "ACTIVE ($" + str.tostring(short_trail_sl, "#.#") + ")"
+        trail_col := color.red
+    else if strategy.position_size != 0
+        trail_status := "Pending..."
+        trail_col := color.orange
+
+    table.cell(info_tbl, 0, 5, "Trail Status",  text_color=color.white, text_size=size.tiny)
+    table.cell(info_tbl, 1, 5, trail_status,     text_color=trail_col,   text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════
+alertcondition(long_sig,        title="🟢 Long Entry",  message="Dynamic RSI v6: LONG Entry!")
+alertcondition(short_sig,       title="🔴 Short Entry", message="Dynamic RSI v6: SHORT Entry!")
+alertcondition(mrv_long_plot,   title="🔵 Exit Long",   message="Dynamic RSI v6: LONG ditutup (MRV).")
+alertcondition(mrv_short_plot,  title="🔵 Exit Short",  message="Dynamic RSI v6: SHORT ditutup (MRV).")

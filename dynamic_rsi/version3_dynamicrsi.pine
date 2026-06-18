@@ -1,0 +1,336 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║   BTC Dynamic RSI v3 — GAP ENTRY  (version3_dynamicrsi.pine)            ║
+// ║                                                                         ║
+// ║   DIBANGUN DI ATAS version2_dynamicrsi_fixed.pine DENGAN TAMBAHAN:       ║
+// ║                                                                         ║
+// ║   ✨ [FITUR BARU] Gap-Entry State Machine                               ║
+// ║      - Long: menunggu gap (rsi - os_clipped) berada pada [9.1, 17.1]   ║
+// ║        sebelum eksekusi. Di luar rentang tersebut, jika kurang/minus   ║
+// ║        akan menunggu (pending), dan jika lebih akan dibatalkan.        ║
+// ║      - Short: menunggu gap (ob_clipped - rsi) berada pada [9.1, 17.1]  ║
+// ║        sebelum eksekusi. Di luar rentang tersebut, jika kurang/minus   ║
+// ║        akan menunggu (pending), dan jika lebih akan dibatalkan.        ║
+// ╚═══════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+strategy("BTC Dynamic RSI v3 (Gap Entry)", overlay=false,
+         initial_capital=100000000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1)
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET SELECTOR
+// ══════════════════════════════════════════════════════════════════════
+preset = input.string("4h (RSI-BB)", "Select Timeframe Preset",
+     options=["1m (Dynamic RSI)", "15m (RSI-BB)", "1h (Dynamic RSI)", "4h (RSI-BB)", "Custom Parameters"],
+     tooltip="Pilih preset sesuai timeframe chart yang sedang dibuka")
+
+// ══════════════════════════════════════════════════════════════════════
+//  CUSTOM INPUTS  (Aktif hanya saat preset = Custom Parameters)
+// ══════════════════════════════════════════════════════════════════════
+custom_mode    = input.string("dynamic", "Custom Mode", options=["dynamic", "rsi-bb"],
+                 group="Custom Settings", tooltip="dynamic=volatility adaptive | rsi-bb=Bollinger Band pada RSI")
+custom_rsi_p   = input.int(14,    "Custom RSI Period",               group="Custom Settings", minval=2)
+custom_vol_w   = input.int(20,    "Custom Vol/BB Window",            group="Custom Settings", minval=5)
+custom_offset  = input.float(10.0,"Custom Base Offset (Dynamic)",    group="Custom Settings", minval=0)
+custom_range   = input.float(15.0,"Custom Vol Range (Dynamic)",      group="Custom Settings", minval=0)
+custom_bb_mult = input.float(2.0, "Custom BB Multiplier (RSI-BB)",   group="Custom Settings", minval=0.5, step=0.1)
+custom_tp      = input.float(0.0, "Custom Take Profit % (0=off)",    group="Custom Settings", minval=0)
+custom_sl      = input.float(0.0, "Custom Stop Loss % (0=off)",      group="Custom Settings", minval=0)
+custom_trail   = input.float(0.0, "Custom Trailing Stop % (0=off)",  group="Custom Settings", minval=0)
+custom_mrv     = input.bool(false,"Custom Use Mean-Rev Exit",        group="Custom Settings",
+                 tooltip="Keluar otomatis ketika RSI kembali ke midline (RSI_SMA atau level 50)")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PARAMETER INITIALIZATION
+// ══════════════════════════════════════════════════════════════════════
+var int    rsi_period   = 14
+var string mode         = "dynamic"
+var int    vol_window   = 20
+var float  base_offset  = 10.0
+var float  vol_range    = 15.0
+var float  bb_mult      = 2.0
+var float  tp_pct       = 0.0
+var float  sl_pct       = 0.0
+var float  trail_pct    = 0.0
+var bool   use_mrv_exit = false
+
+// ══════════════════════════════════════════════════════════════════════
+//  PRESET ASSIGNMENT  (dijalankan setiap bar, nilai stabil karena input konstan)
+// ══════════════════════════════════════════════════════════════════════
+
+if preset == "1m (Dynamic RSI)"
+    rsi_period   := 21
+    mode         := "dynamic"
+    vol_window   := 30
+    base_offset  := 20.0
+    vol_range    := 20.0
+    // ── OPTIMIZED 1m PARAMETERS ────────────────────────────────────
+    tp_pct       := 1.0
+    sl_pct       := 0.75
+    trail_pct    := 1.0
+    use_mrv_exit := true
+
+else if preset == "15m (RSI-BB)"
+    rsi_period   := 9
+    mode         := "rsi-bb"
+    vol_window   := 15
+    bb_mult      := 2.5
+    // ── OPTIMIZED 15m PARAMETERS ───────────────────────────────────
+    tp_pct       := 5.0
+    sl_pct       := 0.5
+    trail_pct    := 0.0
+    use_mrv_exit := false
+
+else if preset == "1h (Dynamic RSI)"
+    rsi_period   := 21
+    mode         := "dynamic"
+    vol_window   := 30
+    base_offset  := 20.0
+    vol_range    := 20.0
+    // ── OPTIMIZED 1h PARAMETERS ────────────────────────────────────
+    tp_pct       := 10.0
+    sl_pct       := 3.0
+    trail_pct    := 0.0
+    use_mrv_exit := false
+
+else if preset == "4h (RSI-BB)"
+    rsi_period   := 21
+    mode         := "rsi-bb"
+    vol_window   := 30
+    bb_mult      := 2.5
+    // ── OPTIMIZED 4h PARAMETERS ────────────────────────────────────
+    tp_pct       := 8.0
+    sl_pct       := 2.0
+    trail_pct    := 0.0
+    use_mrv_exit := false
+
+else  // Custom Parameters
+    rsi_period   := custom_rsi_p
+    mode         := custom_mode
+    vol_window   := custom_vol_w
+    base_offset  := custom_offset
+    vol_range    := custom_range
+    bb_mult      := custom_bb_mult
+    tp_pct       := custom_tp
+    sl_pct       := custom_sl
+    trail_pct    := custom_trail
+    use_mrv_exit := custom_mrv
+
+// ══════════════════════════════════════════════════════════════════════
+//  KALKULASI INDIKATOR
+// ══════════════════════════════════════════════════════════════════════
+
+// 1. RSI
+rsi = ta.rsi(close, rsi_period)
+
+// 2. Dynamic Thresholds — Volatility-Normalized Method
+//    Threshold melebar saat volatilitas tinggi (lebih selektif)
+//    Threshold menyempit saat volatilitas rendah (lebih banyak sinyal)
+returns    = (close - close[1]) / close[1]
+volatility = ta.stdev(returns, vol_window)
+roll_min   = ta.lowest(volatility, 100)
+roll_max   = ta.highest(volatility, 100)
+denom      = roll_max - roll_min
+vol_norm   = denom == 0 ? 0.0 : (volatility - roll_min) / denom
+
+dynamic_ob = 50.0 + base_offset + (vol_range * vol_norm)
+dynamic_os = 50.0 - base_offset - (vol_range * vol_norm)
+
+// 3. RSI Bollinger Bands Method
+//    Band bergerak mengikuti distribusi RSI itu sendiri (adaptive)
+rsi_sma = ta.sma(rsi, vol_window)
+rsi_std = ta.stdev(rsi, vol_window)
+bb_ob   = rsi_sma + (bb_mult * rsi_std)
+bb_os   = rsi_sma - (bb_mult * rsi_std)
+
+// 4. Select Active Thresholds berdasarkan mode
+ob = mode == "rsi-bb" ? bb_ob : dynamic_ob
+os = mode == "rsi-bb" ? bb_os : dynamic_os
+
+// 5. Clip boundary untuk keamanan (jangan sampai OB < 50 atau OS > 50)
+ob_clipped = math.max(50.0, math.min(99.0, ob))
+os_clipped = math.max(1.0,  math.min(50.0, os))
+
+// 6. Midpoint untuk Mean-Reversion Exit
+//    RSI-BB mode: midpoint = RSI_SMA (tengah Bollinger Band RSI)
+//    Dynamic mode: midpoint = 50 (level netral RSI)
+rsi_mid = mode == "rsi-bb" ? rsi_sma : 50.0
+
+// ══════════════════════════════════════════════════════════════════════
+//  SIGNAL GENERATION — CROSSOVER/CROSSUNDER (FIX BUG 5)
+//
+//  SEBELUM (version2 asli):
+//    longCondition  = rsi < os_clipped   ← TRUE selama RSI di bawah OS
+//    shortCondition = rsi > ob_clipped   ← TRUE selama RSI di atas OB
+//    Masalah: bukan sinyal yang presisi, bisa memicu banyak kali
+//
+//  SESUDAH (versi fixed):
+//    Gunakan ta.crossunder / ta.crossover
+//    → Hanya TRUE pada 1 bar tepat saat RSI menembus garis threshold
+//    → Sinyal lebih presisi, entry pada momen terbaik
+// ══════════════════════════════════════════════════════════════════════
+
+// Entry Signals (Menunggu gap minimal 9.1 - 17.1 sebelum eksekusi)
+var bool pending_long = false
+var bool pending_short = false
+
+// Raw trigger dari crossing
+raw_long_trigger  = ta.crossunder(rsi, os_clipped)
+raw_short_trigger = ta.crossover(rsi, ob_clipped)
+
+// Update state pending
+if raw_long_trigger
+    pending_long := true
+    pending_short := false // batalkan short jika ada long baru
+
+if raw_short_trigger
+    pending_short := true
+    pending_long := false // batalkan long jika ada short baru
+
+// Hitung gap jarak sesuai instruksi user:
+// - Long: gap = rsi - os_clipped (jarak rsi ke bb low). Jika rsi di bawah bb low, hasil minus (tunggu).
+// - Short: gap = ob_clipped - rsi (jarak bb atas ke rsi). Jika rsi di atas bb atas, hasil minus (tunggu).
+gap_long = rsi - os_clipped
+gap_short = ob_clipped - rsi
+
+// Logic Pembatalan (Cancel)
+// Jika gap lebih dari 17.1, batalkan sinyal pending
+if pending_long
+    if gap_long > 17.1
+        pending_long := false
+
+if pending_short
+    if gap_short > 17.1
+        pending_short := false
+
+// Logic Eksekusi (Execute)
+long_sig = false
+short_sig = false
+
+// Eksekusi jika gap memenuhi syarat [9.1, 17.1]. Jika kurang atau minus (< 9.1), tetap tunggu (pending).
+if pending_long
+    if gap_long >= 9.1 and gap_long <= 17.1
+        long_sig := true
+        pending_long := false
+
+if pending_short
+    if gap_short >= 9.1 and gap_short <= 17.1
+        short_sig := true
+        pending_short := false
+
+// Mean-Reversion Exit Signals
+// RSI kembali ke midpoint = sinyal bahwa kondisi oversold/overbought sudah berakhir
+mrv_long_exit  = use_mrv_exit and ta.crossover(rsi, rsi_mid)   // RSI naik ke tengah → tutup Long
+mrv_short_exit = use_mrv_exit and ta.crossunder(rsi, rsi_mid)  // RSI turun ke tengah → tutup Short
+
+// ══════════════════════════════════════════════════════════════════════
+//  STRATEGI TRADING
+// ══════════════════════════════════════════════════════════════════════
+
+// Trailing Stop state variables
+var float long_trail_price = na
+var float short_trail_price = na
+
+// Pelacakan harga tertinggi/terendah sejak entri untuk Trailing Stop
+if strategy.position_size > 0
+    // Entry bar atau bar pertama dengan posisi
+    if strategy.position_size[1] <= 0
+        long_trail_price := sl_pct > 0 ? strategy.position_avg_price * (1.0 - sl_pct / 100.0) : (trail_pct > 0 ? strategy.position_avg_price * (1.0 - trail_pct / 100.0) : na)
+    else
+        // update trailing stop jika harga membuat high baru
+        if trail_pct > 0
+            long_trail_price := math.max(nz(long_trail_price, 0.0), high * (1.0 - trail_pct / 100.0))
+else
+    long_trail_price := na
+
+if strategy.position_size < 0
+    // Entry bar atau bar pertama dengan posisi
+    if strategy.position_size[1] >= 0
+        short_trail_price := sl_pct > 0 ? strategy.position_avg_price * (1.0 + sl_pct / 100.0) : (trail_pct > 0 ? strategy.position_avg_price * (1.0 + trail_pct / 100.0) : na)
+    else
+        // update trailing stop jika harga membuat low baru
+        if trail_pct > 0
+            short_trail_price := math.min(nz(short_trail_price, 999999.0), low * (1.0 + trail_pct / 100.0))
+else
+    short_trail_price := na
+
+// LANGKAH 1: TP/SL/Trailing Exit Orders ─────────────────────────────
+// Guard "if tp_pct > 0 or sl_pct > 0 or trail_pct > 0" mencegah pemanggilan exit kosong
+if tp_pct > 0 or sl_pct > 0 or trail_pct > 0
+    if strategy.position_size > 0
+        lim_l = tp_pct > 0 ? strategy.position_avg_price * (1.0 + tp_pct / 100.0) : na
+        strategy.exit("XL", from_entry="Long",  limit=lim_l, stop=long_trail_price)
+    else if strategy.position_size < 0
+        lim_s = tp_pct > 0 ? strategy.position_avg_price * (1.0 - tp_pct / 100.0) : na
+        strategy.exit("XS", from_entry="Short", limit=lim_s, stop=short_trail_price)
+
+// LANGKAH 2: Mean-Reversion Exit ───────────────────────────────────
+// Hanya aktif untuk 1m (use_mrv_exit=true di 1m, false di 15m/1h/4h)
+// Exit ini memastikan profit terkunci saat RSI kembali ke tengah
+if mrv_long_exit and strategy.position_size > 0
+    strategy.close("Long", comment="MRV ↑")
+if mrv_short_exit and strategy.position_size < 0
+    strategy.close("Short", comment="MRV ↓")
+
+// LANGKAH 3: Entry Signals ─────────────────────────────────────────
+// strategy.entry otomatis menutup posisi berlawanan sebelum buka baru
+// (Tidak perlu memanggil strategy.close() terlebih dahulu)
+if long_sig
+    strategy.entry("Long",  strategy.long,  comment="OS ↓")
+if short_sig
+    strategy.entry("Short", strategy.short, comment="OB ↑")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTTING
+// ══════════════════════════════════════════════════════════════════════
+
+// Warna RSI berubah berdasarkan posisi aktif
+rsi_color = strategy.position_size > 0 ? color.new(color.lime, 20) : strategy.position_size < 0 ? color.new(color.red, 20) : color.purple
+
+plot(rsi, title="RSI", color=rsi_color, linewidth=2)
+
+// Bands OB/OS
+ob_plot = plot(ob_clipped, title="Upper Band (OB)", color=color.new(color.red,   30), linewidth=1)
+os_plot = plot(os_clipped, title="Lower Band (OS)", color=color.new(color.green, 30), linewidth=1)
+
+// Midline untuk Mean-Reversion Exit (ditampilkan sebagai referensi)
+plot(rsi_mid, title="MRV Exit Line", color=color.new(color.orange, 40),
+     linewidth=1, style=plot.style_circles)
+
+// Center line 50
+hline(50, "Center 50", color=color.new(color.gray, 60), linestyle=hline.style_dashed)
+
+// Fill antara OB dan OS
+fill(ob_plot, os_plot, color=color.new(color.purple, 93))
+
+// Background warna menunjukkan kondisi posisi saat ini
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 96) : strategy.position_size < 0 ? color.new(color.red, 96) : na, title="Position Background")
+
+// ══════════════════════════════════════════════════════════════════════
+//  PLOTSHAPE — Penanda Entry & Exit
+// ══════════════════════════════════════════════════════════════════════
+
+// Entry arrows
+plotshape(long_sig,  title="Long Entry ▲",  style=shape.triangleup,
+          location=location.bottom, color=color.green, size=size.small)
+plotshape(short_sig, title="Short Entry ▼", style=shape.triangledown,
+          location=location.top,    color=color.red,   size=size.small)
+
+// Mean-Reversion Exit markers (hanya relevan untuk 1m)
+mrv_long_plot  = mrv_long_exit  and strategy.position_size[1] > 0
+mrv_short_plot = mrv_short_exit and strategy.position_size[1] < 0
+plotshape(mrv_long_plot,  title="MRV Exit Long ×",  style=shape.xcross,
+          location=location.top,    color=color.new(color.blue, 20), size=size.tiny)
+plotshape(mrv_short_plot, title="MRV Exit Short ×", style=shape.xcross,
+          location=location.bottom, color=color.new(color.blue, 20), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════
+alertcondition(long_sig,        title="🟢 Long Entry",  message="Dynamic RSI v2 Fixed: LONG Entry! RSI menembus zona OS.")
+alertcondition(short_sig,       title="🔴 Short Entry", message="Dynamic RSI v2 Fixed: SHORT Entry! RSI menembus zona OB.")
+alertcondition(mrv_long_plot,   title="🔵 Exit Long",   message="Dynamic RSI v2 Fixed: LONG ditutup (MRV). RSI kembali ke tengah.")
+alertcondition(mrv_short_plot,  title="🔵 Exit Short",  message="Dynamic RSI v2 Fixed: SHORT ditutup (MRV). RSI kembali ke tengah.")
